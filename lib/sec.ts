@@ -30,16 +30,14 @@ function recentFilingsCount(value: unknown): number | null {
   return parsed.success ? parsed.data.recent.accessionNumber.length : null;
 }
 
-export async function retrieveCompany(cik: string) {
+async function fetchSecJson(sourceUrl: string, signal: AbortSignal) {
   const contact = process.env.SEC_CONTACT_EMAIL?.trim();
   if (!contact || !z.email().safeParse(contact).success) {
     throw new LookupError("configuration_error", "Set SEC_CONTACT_EMAIL to a real operator contact before requesting SEC data.");
   }
 
-  const signal = AbortSignal.timeout(30_000);
   try {
     await waitForRequestSlot(signal);
-    const sourceUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
     const response = await fetch(sourceUrl, {
       headers: { "User-Agent": `BridgeHub ${contact}`, Accept: "application/json" },
       signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
@@ -51,26 +49,52 @@ export async function retrieveCompany(cik: string) {
       await response.body?.cancel();
       throw new LookupError("upstream_unavailable", "SEC could not provide this profile. Retry later.");
     }
-    const parsed = identity.safeParse(await response.json());
-    if (!parsed.success || String(parsed.data.cik).padStart(10, "0") !== cik) {
-      throw new LookupError("upstream_response_error", "SEC returned an invalid or mismatched company profile.");
-    }
-    const data = parsed.data;
-    return {
-      cik,
-      ticker: strings(data.tickers),
-      name: scalar(data.name),
-      sic: scalar(data.sic),
-      sic_description: scalar(data.sicDescription),
-      exchange: strings(data.exchanges),
-      fiscal_year_end: scalar(data.fiscalYearEnd),
-      state_of_incorporation: scalar(data.stateOfIncorporation),
-      recent_filings_count: recentFilingsCount(data.filings),
-      source_url: sourceUrl,
-      retrieved_at: new Date().toISOString(),
-    };
+    return { data: await response.json() as unknown, retrieved_at: new Date().toISOString() };
   } catch (error) {
     if (error instanceof LookupError) throw error;
     throw new LookupError("upstream_unavailable", "SEC could not be reached or returned unreadable data. Retry later.");
   }
+}
+
+const directorySchema = z.record(z.string().regex(/^\d+$/), z.object({
+  cik_str: z.number().int().positive().max(9999999999),
+  ticker: z.string().min(1),
+  title: z.string().min(1),
+}));
+
+export async function retrieveDirectory(signal: AbortSignal) {
+  const sourceUrl = "https://www.sec.gov/files/company_tickers.json";
+  const response = await fetchSecJson(sourceUrl, signal);
+  const parsed = directorySchema.safeParse(response?.data);
+  if (!response || !parsed.success) {
+    throw new LookupError("upstream_response_error", "SEC's company directory is unavailable or invalid.");
+  }
+  return {
+    companies: Object.values(parsed.data).map((row) => ({ cik: String(row.cik_str).padStart(10, "0"), ticker: row.ticker, name: row.title })),
+    source: { source_url: sourceUrl, retrieved_at: response.retrieved_at },
+  };
+}
+
+export async function retrieveCompany(cik: string, signal = AbortSignal.timeout(30_000)) {
+  const sourceUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
+  const response = await fetchSecJson(sourceUrl, signal);
+  if (!response) return null;
+  const parsed = identity.safeParse(response.data);
+  if (!parsed.success || String(parsed.data.cik).padStart(10, "0") !== cik) {
+    throw new LookupError("upstream_response_error", "SEC returned an invalid or mismatched company profile.");
+  }
+  const data = parsed.data;
+  return {
+    cik,
+    ticker: strings(data.tickers),
+    name: scalar(data.name),
+    sic: scalar(data.sic),
+    sic_description: scalar(data.sicDescription),
+    exchange: strings(data.exchanges),
+    fiscal_year_end: scalar(data.fiscalYearEnd),
+    state_of_incorporation: scalar(data.stateOfIncorporation),
+    recent_filings_count: recentFilingsCount(data.filings),
+    source_url: sourceUrl,
+    retrieved_at: response.retrieved_at,
+  };
 }

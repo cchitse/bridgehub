@@ -113,20 +113,13 @@ describe("company profiles over the MCP HTTP interface", () => {
     expect((await lookup("320193")).structuredContent).toMatchObject({ results: [{ recent_filings_count: null }] });
   });
 
-  it.each(["", " ", "0", "CIK", "CIKabc", "12345678901", "x".repeat(201), 320193, null])("rejects invalid query %s without SEC access", async (query) => {
+  it.each(["", " ", "0", "CIKabc", "12345678901", "x".repeat(201), 320193, null])("rejects invalid query %s without SEC access", async (query) => {
     expect((await lookup(query)).isError).toBe(true);
     expect(secFetch).not.toHaveBeenCalled();
   });
 
   it.each([0, 21, 1.5, "10", null])("rejects invalid limit %s", async (limit) => {
     expect((await lookup("320193", limit)).isError).toBe(true);
-    expect(secFetch).not.toHaveBeenCalled();
-  });
-
-  it("explains that ticker lookup belongs to the next ticket", async () => {
-    const result = await lookup("AAPL");
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ outcome: "error", error: { category: "unsupported_query" } });
     expect(secFetch).not.toHaveBeenCalled();
   });
 
@@ -185,5 +178,82 @@ describe("company profiles over the MCP HTTP interface", () => {
     const result = await realFetch(endpoint, { method: "POST", headers: { Origin: "https://foreign.example" }, body: "{}" });
     expect(result.status).toBe(403);
     expect(secFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("ticker and company-name search", () => {
+  const directoryUrl = "https://www.sec.gov/files/company_tickers.json";
+  const rows = [
+    { cik_str: 320193, ticker: "AAPL", title: "Apple Inc." },
+    { cik_str: 320193, ticker: "TEST", title: "Apple Inc." },
+    { cik_str: 2, ticker: "OTHER", title: "AAPL Holdings" },
+    { cik_str: 3, ticker: "FRUIT", title: "Apple Farms" },
+  ];
+  function serveDirectory(entries = rows) {
+    secFetch.mockImplementation(async (url) => {
+      if (String(url) === directoryUrl) return Response.json(Object.fromEntries(entries.map((row, index) => [index, row])));
+      const cik = /CIK(\d{10})\.json$/.exec(String(url))?.[1];
+      const row = entries.find((entry) => String(entry.cik_str).padStart(10, "0") === cik);
+      if (!row) throw new Error("Unexpected profile request");
+      return Response.json({ ...fixture, cik, name: row.title });
+    });
+  }
+
+  it.each(["AAPL", "aApL", " AAPL "])("resolves %s using ticker precedence and directory provenance", async (query) => {
+    serveDirectory();
+    const before = Date.now();
+    const result = await lookup(query);
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ query: query.trim(), outcome: "ok", truncated: false,
+      directory_source: { source_url: directoryUrl }, results: [{ cik: "0000320193", ticker: ["AAPL", "TEST"], exchange: ["Nasdaq"] }] });
+    const data = result.structuredContent as { results: unknown[]; directory_source: { retrieved_at: string } };
+    expect(data.results).toHaveLength(1);
+    expect(Date.parse(data.directory_source.retrieved_at)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(data.directory_source.retrieved_at)).toBeLessThanOrEqual(Date.now());
+    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual([directoryUrl, "https://data.sec.gov/submissions/CIK0000320193.json"]);
+  });
+
+  it("matches name substrings, deduplicates CIKs, and sorts before limiting", async () => {
+    serveDirectory();
+    const all = await lookup("aPpLe");
+    expect(all.structuredContent).toMatchObject({ limit: 10, truncated: false, results: [{ cik: "0000000003" }, { cik: "0000320193" }] });
+    secFetch.mockClear();
+    const limited = await lookup("apple", 1);
+    expect(limited.structuredContent).toMatchObject({ truncated: true, results: [{ cik: "0000000003" }] });
+    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual([directoryUrl, "https://data.sec.gov/submissions/CIK0000000003.json"]);
+  });
+
+  it.each(["CIK", "cik"])("allows the bare %s trading symbol without treating it as an identifier prefix", async (query) => {
+    serveDirectory([{ cik_str: 810766, ticker: "CIK", title: "Example Fund" }]);
+    expect((await lookup(query)).structuredContent).toMatchObject({ outcome: "ok", results: [{ cik: "0000810766" }] });
+  });
+
+  it.each([undefined, 20])("applies limit %s before profile requests and uses CIK as the name tie-breaker", async (limit) => {
+    serveDirectory(Array.from({ length: 21 }, (_, index) => ({ cik_str: 21 - index, ticker: `T${index}`, title: "Same Name" })));
+    const result = await lookup("same", limit);
+    const count = limit ?? 10;
+    const data = result.structuredContent as { results: { cik: string }[] };
+    expect(result.structuredContent).toMatchObject({ limit: count, truncated: true, outcome: "ok" });
+    expect(data.results.map((row) => row.cik)).toEqual(Array.from({ length: count }, (_, index) => String(index + 1).padStart(10, "0")));
+    expect(secFetch).toHaveBeenCalledTimes(count + 1);
+  });
+
+  it("returns genuine no matches without any profile requests", async () => {
+    serveDirectory();
+    expect((await lookup("nonexistent company")).structuredContent).toMatchObject({ outcome: "no_matches", results: [], truncated: false, directory_source: { source_url: directoryUrl } });
+    expect(secFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps direct CIK lookup independent of directory failure", async () => {
+    secFetch.mockImplementation(async (url) => String(url) === directoryUrl ? new Response(null, { status: 503 }) : Response.json(fixture));
+    expect((await lookup("AAPL")).isError).toBe(true);
+    secFetch.mockClear();
+    expect((await lookup("320193")).structuredContent).toMatchObject({ outcome: "ok" });
+    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual(["https://data.sec.gov/submissions/CIK0000320193.json"]);
+  });
+
+  it.each([{ unexpected: "shape" }, { 0: { cik_str: 0, ticker: "BAD", title: "Bad" } }])("does not treat malformed directory data as no matches", async (body) => {
+    secFetch.mockImplementation(async () => Response.json(body));
+    expect((await lookup("apple")).isError).toBe(true);
   });
 });
