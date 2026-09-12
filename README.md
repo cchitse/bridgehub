@@ -1,6 +1,12 @@
 # BridgeHub — company search
 
-A Next.js application with three English informational pages and one anonymous Streamable HTTP MCP tool: `us_search_sec_company`. Search by ticker, company-name substring, or CIK. Directory caching and shared request controls are implemented. Public hosting remains ticket 06.
+A Next.js application with three English informational pages and one anonymous Streamable HTTP MCP tool: `us_search_sec_company`. Search by ticker, company-name substring, or CIK. Directory caching and shared request controls are implemented.
+
+Public website: https://bridgehub-mvp.vercel.app
+
+Public MCP: https://bridgehub-mvp.vercel.app/api/mcp
+
+The public service runs on Vercel with Upstash Redis and does not require your local server. See [deployment settings](docs/deployment.md).
 
 ## Website
 
@@ -38,7 +44,7 @@ url = "http://127.0.0.1:3000/api/mcp"
 
 Restart Codex, check `/mcp`, and ask: “Use BridgeHub to search AAPL. Include the official source URLs and retrieval times.” Codex requires its own installation and sign-in; BridgeHub needs no user key or LLM API access. See [official MCP configuration guidance](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-For a production-mode local check, configure the Redis settings below, then use `npm run build` followed by `npm start`. Static pages and MCP discovery work without Redis configuration, but production searches fail closed. Both local commands bind to loopback. Public hosting is not part of this ticket.
+For a production-mode local check, configure the Redis settings below, then use `npm run build` followed by `npm start`. Static pages and MCP discovery work without Redis configuration, but production searches fail closed. Both local commands bind to loopback; the public deployment runs independently on Vercel.
 
 ## Tool contract
 
@@ -82,7 +88,7 @@ Redis executes search admission atomically using a rolling window and Redis serv
 
 Without credentials, development uses a single-process in-memory equivalent with the same limits and cache rules. Its state resets on restart and is not suitable for multi-instance deployment. Production (`NODE_ENV=production` or Vercel) never falls back to memory. Missing/partial credentials, Redis errors, invalid Redis responses, and storage timeouts fail closed as `service_unavailable`; no unguarded SEC request is sent. Redis commands have a five-second timeout bounded by the overall tool deadline. Static pages and tool discovery do not access Redis.
 
-No cloud database or paid resource was provisioned for this ticket. Choose the account/database and check current provider costs during deployment; credentials stay server-side. Upstash connectivity from the chosen deployment remains a ticket-06 verification step.
+The public deployment uses the Upstash Free database `bridgehub-redis`, with automatic paid upgrades and eviction disabled. Production SEC lookups and shared directory cache reuse have been verified. Credentials stay server-side; usage remains subject to provider free-plan allowances.
 
 ## Real Redis integration tests
 
@@ -97,4 +103,4 @@ npm run test:redis
 
 Use a local test Redis instance. The suite creates unique expiring keys; it does not flush the database. The child-process probe is skipped in the parent run and executed explicitly by its restart test. Without `REDIS_TEST_URL`, these integration cases are skipped. Stop the REST adapter after testing.
 
-The route validates localhost hosts and rejects foreign browser origins. A future deployment can specify `BRIDGEHUB_ORIGIN` as its exact origin; deployment settings and shared controls still require ticket 06 validation. SEC and network restrictions may prevent live retrieval; a controlled test pass alone is not evidence of successful SEC connectivity.
+The route validates allowed hosts and rejects foreign browser origins. Production sets `BRIDGEHUB_ORIGIN` to `https://bridgehub-mvp.vercel.app`. Live SEC access was verified from that deployed runtime; availability may change with SEC and network conditions.

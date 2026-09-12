@@ -1,0 +1,16 @@
+.env*
+.git/
+.scratch/
+.agents/
+.codex/
+.next/
+node_modules/
+coverage/
+*.tsbuildinfo
+*.pdf
+docs/
+tests/
+scripts/
+SEC.md
+SPEC.md
+skills-lock.json

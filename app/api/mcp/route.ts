@@ -3,6 +3,8 @@ import { createMcpServer } from "../../../lib/mcp";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Leave room for the 30-second lookup budget and protocol/connection overhead.
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   const url = new URL(request.url);
