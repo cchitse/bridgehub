@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:mcp": "vitest run tests/mcp.test.ts",
+    "test:redis": "vitest run tests/redis.test.ts",
     "check:live": "node scripts/check-live.mjs"
   },
   "dependencies": {

@@ -1,28 +1,14 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
+import { LookupError } from "./errors";
+import type { SharedState } from "./state";
 
-export class LookupError extends Error {
-  constructor(public readonly category: string, message: string, public readonly retryable = false) { super(message); }
-}
-
-export function describeFailure(error: unknown) {
-  const failure = error instanceof LookupError ? error : new LookupError("internal_error", "BridgeHub could not complete this lookup.");
-  return { category: failure.category, message: failure.message, retryable: failure.retryable };
-}
-
-// Local, single-process pacing only. Shared deployment limits belong to ticket 04.
-let requestTimes: number[] = [];
-
-async function waitForRequestSlot(signal: AbortSignal) {
+async function waitForRequestSlot(state: SharedState, signal: AbortSignal) {
   while (true) {
     signal.throwIfAborted();
-    const now = Date.now();
-    requestTimes = requestTimes.filter((time) => time > now - 1000);
-    if (requestTimes.length < 5) {
-      requestTimes.push(now);
-      return;
-    }
-    await delay(Math.max(1, requestTimes[0] + 1001 - now), undefined, { signal });
+    const permit = await state.reserveSec(signal);
+    if (permit.waitMs === 0) return permit;
+    await delay(permit.waitMs + 1, undefined, { signal });
   }
 }
 
@@ -35,15 +21,20 @@ function recentFilingsCount(value: unknown): number | null {
   return parsed.success ? parsed.data.recent.accessionNumber.length : null;
 }
 
-async function fetchSecJson(sourceUrl: string, signal: AbortSignal) {
+async function fetchSecJson(sourceUrl: string, state: SharedState, signal: AbortSignal) {
   const contact = process.env.SEC_CONTACT_EMAIL?.trim();
   if (!contact || !z.email().safeParse(contact).success) {
     throw new LookupError("configuration_error", "Set SEC_CONTACT_EMAIL to a real operator contact before requesting SEC data.");
   }
 
   let requestSignal = signal;
+  let permit: Awaited<ReturnType<SharedState["reserveSec"]>> | undefined;
   try {
-    await waitForRequestSlot(signal);
+    permit = await waitForRequestSlot(state, signal);
+    signal.throwIfAborted();
+    if (performance.now() > permit.expiresAt - 11000) {
+      throw new LookupError("upstream_timeout", "The reserved SEC slot expired before it could be used. Retry later.", true);
+    }
     requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
     const response = await fetch(sourceUrl, {
       headers: { "User-Agent": `BridgeHub ${contact}`, Accept: "application/json" },
@@ -65,6 +56,11 @@ async function fetchSecJson(sourceUrl: string, signal: AbortSignal) {
     if (requestSignal.aborted) throw new LookupError("upstream_timeout", "The SEC request or overall lookup deadline expired. Retry later.", true);
     if (error instanceof SyntaxError) throw new LookupError("upstream_response_error", "SEC returned unreadable data instead of a company response.");
     throw new LookupError("upstream_unavailable", "SEC could not be reached. Retry later.", true);
+  } finally {
+    if (permit) {
+      try { await state.finishSec(permit.token, signal); }
+      catch { /* Keep the longer crash lease when cleanup fails; never release unconfirmed capacity. */ }
+    }
   }
 }
 
@@ -74,22 +70,39 @@ const directorySchema = z.record(z.string().regex(/^\d+$/), z.object({
   title: z.string().min(1),
 }));
 
-export async function retrieveDirectory(signal: AbortSignal) {
+const directoryCacheSchema = z.object({ data: directorySchema, retrieved_at: z.iso.datetime() });
+const directoryTtl = 86_400_000;
+
+export async function retrieveDirectory(state: SharedState, signal: AbortSignal) {
   const sourceUrl = "https://www.sec.gov/files/company_tickers.json";
-  const response = await fetchSecJson(sourceUrl, signal);
+  const cached = await state.get("directory", signal);
+  if (cached !== null) {
+    let entry;
+    try { entry = directoryCacheSchema.parse(JSON.parse(cached)); }
+    catch { throw new LookupError("service_unavailable", "BridgeHub's cached directory is invalid. Retry later.", true); }
+    if (Date.now() - Date.parse(entry.retrieved_at) < directoryTtl && Date.parse(entry.retrieved_at) <= Date.now()) {
+      return directoryResult(entry.data, sourceUrl, entry.retrieved_at);
+    }
+  }
+  const response = await fetchSecJson(sourceUrl, state, signal);
   const parsed = directorySchema.safeParse(response?.data);
   if (!response || !parsed.success) {
     throw new LookupError("upstream_response_error", "SEC's company directory is unavailable or invalid.");
   }
+  await state.set("directory", JSON.stringify({ data: parsed.data, retrieved_at: response.retrieved_at }), directoryTtl, signal);
+  return directoryResult(parsed.data, sourceUrl, response.retrieved_at);
+}
+
+function directoryResult(data: z.infer<typeof directorySchema>, sourceUrl: string, retrievedAt: string) {
   return {
-    companies: Object.values(parsed.data).map((row) => ({ cik: String(row.cik_str).padStart(10, "0"), ticker: row.ticker, name: row.title })),
-    source: { source_url: sourceUrl, retrieved_at: response.retrieved_at },
+    companies: Object.values(data).map((row) => ({ cik: String(row.cik_str).padStart(10, "0"), ticker: row.ticker, name: row.title })),
+    source: { source_url: sourceUrl, retrieved_at: retrievedAt },
   };
 }
 
-export async function retrieveCompany(cik: string, signal = AbortSignal.timeout(30_000)) {
+export async function retrieveCompany(cik: string, state: SharedState, signal: AbortSignal) {
   const sourceUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
-  const response = await fetchSecJson(sourceUrl, signal);
+  const response = await fetchSecJson(sourceUrl, state, signal);
   if (!response) return null;
   const parsed = identity.safeParse(response.data);
   if (!parsed.success || String(parsed.data.cik).padStart(10, "0") !== cik) {

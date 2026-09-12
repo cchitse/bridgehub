@@ -1,6 +1,6 @@
 # BridgeHub — company search
 
-A local Next.js application exposing one anonymous Streamable HTTP MCP tool: `us_search_sec_company`. Search by ticker, company-name substring, or CIK. The three-page website, shared cache/deployment limits, and publishing belong to later tickets.
+A Next.js application exposing one anonymous Streamable HTTP MCP tool: `us_search_sec_company`. Search by ticker, company-name substring, or CIK. The directory cache and shared request controls are implemented. The three-page website and publishing belong to later tickets.
 
 ## Run locally
 
@@ -28,7 +28,7 @@ url = "http://127.0.0.1:3000/api/mcp"
 
 Restart Codex, check `/mcp`, and ask: “Use BridgeHub to search AAPL. Include the official source URLs and retrieval times.” Codex requires its own installation and sign-in; BridgeHub needs no user key or LLM API access. See [official MCP configuration guidance](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-For a production-mode local check, use `npm run build` followed by `npm start`. Both local commands bind to loopback. Public hosting is not part of this ticket.
+For a production-mode local check, configure the Redis settings below, then use `npm run build` followed by `npm start`. Static pages and MCP discovery work without Redis configuration, but production searches fail closed. Both local commands bind to loopback. Public hosting is not part of this ticket.
 
 ## Tool contract
 
@@ -38,7 +38,7 @@ For a production-mode local check, use `npm run build` followed by `npm start`. 
 
 The output envelope includes query, limit, outcome, results, and truncated. Directory-based searches also include `directory_source` with `source_url` and the directory's original `retrieved_at`. Each profile includes cik, ticker, name, sic, sic_description, exchange, fiscal_year_end, state_of_incorporation, recent_filings_count, source_url, and retrieved_at. Tickers/exchanges are arrays; unavailable scalar metadata is null. Recent filings count means the number of accession numbers in the fetched recent filings array, not a lifetime count. The UTC retrieval time records when BridgeHub fetched the data, not SEC's last modification time.
 
-This slice fetches the directory on demand; the shared 24-hour cache belongs to ticket 04. If some selected profiles fail, successful profiles are returned with `outcome: partial`, a warning, and a `failures` list containing each failed CIK, category, message, and retryable flag. Truncation due to the result limit remains independent of retrieval failures. Partial responses retain usable data and do not set MCP's error flag.
+The successful ticker directory is cached for 24 hours with its original retrieval timestamp. Expired entries are refreshed on demand; a failed refresh never silently serves stale data. Profiles are always fetched on demand. If some selected profiles fail, successful profiles are returned with `outcome: partial`, a warning, and a `failures` list containing each failed CIK, category, message, and retryable flag. Truncation due to the result limit remains independent of retrieval failures. Partial responses retain usable data and do not set MCP's error flag.
 
 If every selected profile fails, the response uses `outcome: error` and MCP's error flag, retaining directory provenance, truncation, and individual failure details. The aggregate `profiles_unavailable` error is retryable if at least one failure is retryable. Direct CIK or discovery errors also set MCP's error flag. Failures never synthesize missing profiles.
 
@@ -62,6 +62,29 @@ npm run check:live
 
 The interface tests use the real SDK client over a loopback HTTP server invoking the actual Next.js POST handler. Only outbound SEC fetch responses are controlled. They never contact SEC or use the real operator email. The separate live script searches AAPL through the running application and verifies Apple's identity plus directory and profile provenance without asserting volatile filing counts. `MCP_URL` can select another endpoint and `MCP_QUERY=320193` can recheck direct CIK lookup.
 
-Outbound SEC requests have a 10-second timeout within a 30-second operation budget, no automatic retries, and a single-process limit of five starts per rolling second. This is sufficient for local evaluation, not deployment-wide protection: ticket 04 supplies shared controls. Request pacing counts actual dispatch times even when the event loop is delayed.
+Outbound SEC requests have a 10-second timeout within a 30-second operation budget, with no automatic retries. Shared admission allows ten searches per rolling minute and five SEC requests per rolling second. A search beyond the budget returns `rate_limited` before reaching SEC. Upstream capacity is awaited only within the lookup deadline. Directory reads and profile reads consume the same SEC budget. Requests that pass the SDK input schema consume search capacity even if later validation or retrieval fails.
+
+## Shared state configuration
+
+Production uses [Upstash Redis's HTTPS REST API](https://upstash.com/docs/redis/features/restapi). Set `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (a read/write token), and a stable `BRIDGEHUB_STATE_NAMESPACE` shared by every instance. Use a separate namespace for an unrelated deployment, but never a per-instance or per-build namespace for the same service.
+
+Redis executes search admission atomically using a rolling window and Redis server time. SEC capacity uses five shared slots held through request completion and for another 1,001 milliseconds, so delayed storage replies cannot bunch actual request starts beyond the limit. Abandoned slots expire after 45 seconds; dispatch rejects permits too close to expiry. Failed cleanup retains the longer lease. This conservative policy can reduce throughput when requests are slow. Expiring sorted sets contain random request IDs and timestamps, not queries or personal identifiers. Cache keys contain only the public directory and original retrieval time. No user accounts or query history are stored. Application restarts do not reset Redis state. Use a dedicated non-evicting database; manual deletion/eviction of limiter keys would reset the budget.
+
+Without credentials, development uses a single-process in-memory equivalent with the same limits and cache rules. Its state resets on restart and is not suitable for multi-instance deployment. Production (`NODE_ENV=production` or Vercel) never falls back to memory. Missing/partial credentials, Redis errors, invalid Redis responses, and storage timeouts fail closed as `service_unavailable`; no unguarded SEC request is sent. Redis commands have a five-second timeout bounded by the overall tool deadline. Static pages and tool discovery do not access Redis.
+
+No cloud database or paid resource was provisioned for this ticket. Choose the account/database and check current provider costs during deployment; credentials stay server-side. Upstash connectivity from the chosen deployment remains a ticket-06 verification step.
+
+## Real Redis integration tests
+
+The default tests run without a Redis installation. Optional integration tests execute the actual Lua script on real Redis through a loopback-only REST adapter, exercise two MCP HTTP instances, and launch a fresh process to verify state survives application restarts.
+
+With Redis running on localhost port 6379, run `python3 scripts/redis-rest-bridge.py` in that environment. On this Windows machine Redis was installed in Ubuntu-24.04 WSL for testing. The adapter listens on port 8079 and accepts only the test token `local-test`. It is a development test helper, not a deployment service.
+
+```powershell
+$env:REDIS_TEST_URL = 'http://127.0.0.1:8079'
+npm run test:redis
+```
+
+Use a local test Redis instance. The suite creates unique expiring keys; it does not flush the database. The child-process probe is skipped in the parent run and executed explicitly by its restart test. Without `REDIS_TEST_URL`, these integration cases are skipped. Stop the REST adapter after testing.
 
 The route validates localhost hosts and rejects foreign browser origins. A future deployment can specify `BRIDGEHUB_ORIGIN` as its exact origin; deployment settings and shared controls still require ticket 06 validation. SEC and network restrictions may prevent live retrieval; a controlled test pass alone is not evidence of successful SEC connectivity.

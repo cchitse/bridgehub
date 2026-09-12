@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { describeFailure } from "./sec";
+import { describeFailure } from "./errors";
 import { searchCompanies } from "./search";
 
 export function createMcpServer() {

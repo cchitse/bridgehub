@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "../app/api/mcp/route";
+import * as stateModule from "../lib/state";
 
 const realFetch = globalThis.fetch;
 const secFetch = vi.fn<typeof fetch>();
@@ -41,6 +42,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  vi.spyOn(stateModule, "getSharedState").mockReturnValue(stateModule.createMemoryState());
   vi.stubEnv("SEC_CONTACT_EMAIL", "operator@example.org");
   secFetch.mockReset().mockImplementation(async () => Response.json(fixture));
   vi.stubGlobal("fetch", secFetch);
@@ -53,6 +55,68 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+describe("cached discovery and shared admission over MCP", () => {
+  const directoryUrl = "https://www.sec.gov/files/company_tickers.json";
+  const directory = { 0: { cik_str: 320193, ticker: "AAPL", title: "Apple Inc." } };
+
+  it("reuses the directory and its timestamp but always retrieves profiles", async () => {
+    secFetch.mockImplementation(async (url) => Response.json(String(url) === directoryUrl ? directory : fixture));
+    const first = await lookup("AAPL");
+    secFetch.mockClear();
+    const second = await lookup("apple");
+    expect((second.structuredContent as Record<string, unknown>).directory_source).toEqual((first.structuredContent as Record<string, unknown>).directory_source);
+    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual(["https://data.sec.gov/submissions/CIK0000320193.json"]);
+  });
+
+  it("expires the directory at 24 hours and does not serve stale data after refresh failure", async () => {
+    vi.setSystemTime(new Date("2026-09-12T00:00:00Z"));
+    // A closure reads the current clock rather than a captured original Date.now function.
+    vi.mocked(stateModule.getSharedState).mockReturnValue(stateModule.createMemoryState(() => Date.now()));
+    secFetch.mockImplementation(async (url) => Response.json(String(url) === directoryUrl ? directory : fixture));
+    await lookup("AAPL");
+    vi.setSystemTime(new Date("2026-09-13T00:00:00Z"));
+    secFetch.mockClear().mockImplementation(async () => new Response(null, { status: 503 }));
+    const failed = await lookup("AAPL");
+    expect(failed.isError).toBe(true);
+    expect(failed.structuredContent).toMatchObject({ outcome: "error", results: [] });
+    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual([directoryUrl]);
+    secFetch.mockClear().mockImplementation(async (url) => Response.json(String(url) === directoryUrl ? directory : fixture));
+    const refreshed = await lookup("AAPL");
+    expect(refreshed.structuredContent).toMatchObject({ outcome: "ok", directory_source: { retrieved_at: "2026-09-13T00:00:00.000Z" } });
+  });
+
+  it("rejects excess searches before reaching SEC", async () => {
+    const responses = await Promise.all(Array.from({ length: 12 }, () => lookup("320193")));
+    expect(responses.filter((result) => !result.isError)).toHaveLength(10);
+    expect(responses.filter((result) => result.isError)).toHaveLength(2);
+    for (const response of responses.filter((result) => result.isError)) {
+      expect(response.structuredContent).toMatchObject({ error: { category: "rate_limited", retryable: true } });
+    }
+    expect(secFetch).toHaveBeenCalledTimes(10);
+  });
+
+  it("fails closed on unavailable state without affecting tool discovery", async () => {
+    const state = stateModule.createMemoryState();
+    state.take = async () => { throw new Error("private storage details"); };
+    vi.mocked(stateModule.getSharedState).mockReturnValue(state);
+    const result = await lookup("320193");
+    expect(result.isError).toBe(true);
+    expect(secFetch).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("private storage details");
+    expect((await client.listTools()).tools).toHaveLength(1);
+  });
+
+  it("returns service unavailable when production credentials are missing", async () => {
+    vi.mocked(stateModule.getSharedState).mockRestore();
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("UPSTASH_REDIS_REST_URL", "");
+    vi.stubEnv("UPSTASH_REDIS_REST_TOKEN", "");
+    expect((await lookup("320193")).structuredContent).toMatchObject({ error: { category: "service_unavailable", retryable: true } });
+    expect(secFetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("unavailable and incomplete SEC data", () => {
@@ -347,7 +411,7 @@ describe("ticker and company-name search", () => {
     secFetch.mockClear();
     const limited = await lookup("apple", 1);
     expect(limited.structuredContent).toMatchObject({ truncated: true, results: [{ cik: "0000000003" }] });
-    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual([directoryUrl, "https://data.sec.gov/submissions/CIK0000000003.json"]);
+    expect(secFetch.mock.calls.map(([url]) => String(url))).toEqual(["https://data.sec.gov/submissions/CIK0000000003.json"]);
   });
 
   it.each(["CIK", "cik"])("allows the bare %s trading symbol without treating it as an identifier prefix", async (query) => {

@@ -1,13 +1,18 @@
-import { describeFailure, LookupError, retrieveCompany, retrieveDirectory } from "./sec";
+import { describeFailure, LookupError } from "./errors";
+import { retrieveCompany, retrieveDirectory } from "./sec";
+import { getSharedState } from "./state";
 
 export async function searchCompanies(query: string, limit: number) {
   // One budget covers discovery, waiting for request slots, and all profiles.
   const signal = AbortSignal.timeout(30_000);
+  const state = getSharedState();
+  const wait = await state.take("search", 10, 60_000, signal);
+  if (wait > 0) throw new LookupError("rate_limited", `BridgeHub search limit reached. Retry in ${Math.ceil(wait / 1000)} seconds.`, true);
   const match = /^(?:CIK)?(\d{1,10})$/i.exec(query);
   if (match) {
     const cik = match[1].padStart(10, "0");
     if (cik === "0000000000") throw new LookupError("invalid_input", "CIK must be greater than zero.");
-    const profile = await retrieveCompany(cik, signal);
+    const profile = await retrieveCompany(cik, state, signal);
     return { query, limit, outcome: profile ? "ok" : "no_matches", results: profile ? [profile] : [], truncated: false };
   }
   // Bare CIK is also a trading symbol; only a longer prefix denotes explicit CIK input.
@@ -15,7 +20,7 @@ export async function searchCompanies(query: string, limit: number) {
     throw new LookupError("invalid_input", "Enter a CIK containing 1–10 digits, optionally prefixed with CIK.");
   }
 
-  const directory = await retrieveDirectory(signal);
+  const directory = await retrieveDirectory(state, signal);
   const needle = query.toLowerCase();
   const tickerMatches = directory.companies.filter((company) => company.ticker.toLowerCase() === needle);
   const matches = tickerMatches.length ? tickerMatches : directory.companies.filter((company) => company.name.toLowerCase().includes(needle));
@@ -24,7 +29,7 @@ export async function searchCompanies(query: string, limit: number) {
   for (const company of matches) if (!unique.has(company.cik)) unique.set(company.cik, company);
   const selected = [...unique.values()].slice(0, limit);
   const settled = await Promise.allSettled(selected.map(async (company) => {
-    const profile = await retrieveCompany(company.cik, signal);
+    const profile = await retrieveCompany(company.cik, state, signal);
     if (!profile) throw new LookupError("upstream_not_found", "SEC no longer provides the profile selected from its directory.");
     return profile;
   }));
