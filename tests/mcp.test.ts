@@ -52,6 +52,133 @@ afterEach(async () => {
   await client.close();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
+describe("unavailable and incomplete SEC data", () => {
+  const directoryUrl = "https://www.sec.gov/files/company_tickers.json";
+  const directory = {
+    0: { cik_str: 1, ticker: "ONE", title: "Group One" },
+    1: { cik_str: 2, ticker: "TWO", title: "Group Two" },
+    2: { cik_str: 3, ticker: "THREE", title: "Group Z" },
+  };
+
+  it("retains successful profiles and provenance while reporting failed CIKs independently of truncation", async () => {
+    secFetch.mockImplementation(async (url) => {
+      if (String(url) === directoryUrl) return Response.json(directory);
+      if (String(url).endsWith("0000000001.json")) return Response.json({ ...fixture, cik: 1 });
+      return new Response("SEC blocked private-detail", { status: 403 });
+    });
+    const result = await lookup("group", 2);
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ outcome: "partial", truncated: true,
+      results: [{ cik: "0000000001", source_url: "https://data.sec.gov/submissions/CIK0000000001.json" }],
+      failures: [{ cik: "0000000002", category: "upstream_blocked", retryable: false }],
+      directory_source: { source_url: directoryUrl },
+    });
+    const data = result.structuredContent as { results: { retrieved_at: string }[]; warnings: string[] };
+    expect(data.results).toHaveLength(1);
+    expect(data.warnings[0]).toMatch(/incomplete/i);
+    expect(Number.isFinite(Date.parse(data.results[0].retrieved_at))).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("private-detail");
+    expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual(result.structuredContent);
+    expect(secFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports total profile failure with failed CIKs, retained discovery provenance, and MCP error signaling", async () => {
+    secFetch.mockImplementation(async (url) => String(url) === directoryUrl ? Response.json(directory) : new Response(null, { status: 503 }));
+    const result = await lookup("group", 2);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ outcome: "error", results: [], truncated: true,
+      error: { category: "profiles_unavailable", retryable: true },
+      failures: [{ cik: "0000000001", category: "upstream_unavailable" }, { cik: "0000000002", category: "upstream_unavailable" }],
+      directory_source: { source_url: directoryUrl },
+    });
+    expect(secFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("treats a selected profile 404 as an incomplete result rather than no matches", async () => {
+    secFetch.mockImplementation(async (url) => {
+      if (String(url) === directoryUrl) return Response.json(directory);
+      return String(url).endsWith("0000000001.json") ? Response.json({ ...fixture, cik: 1 }) : new Response(null, { status: 404 });
+    });
+    expect((await lookup("group")).structuredContent).toMatchObject({ outcome: "partial", truncated: false,
+      failures: [{ cik: "0000000002", category: "upstream_not_found" }, { cik: "0000000003", category: "upstream_not_found" }] });
+  });
+
+  it.each([
+    [403, "upstream_blocked", false], [429, "upstream_rate_limited", true], [503, "upstream_unavailable", true],
+  ])("classifies SEC status %s without exposing the body or retrying", async (status, category, retryable) => {
+    secFetch.mockImplementation(async () => new Response("sensitive backend body", { status: status as number }));
+    const result = await lookup("320193");
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ outcome: "error", results: [], error: { category, retryable } });
+    expect(JSON.stringify(result)).not.toContain("sensitive backend body");
+    expect(secFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["<html>blocked</html>", "{not json"])("rejects a malformed success body as an upstream response error", async (body) => {
+    secFetch.mockImplementation(async () => new Response(body, { status: 200 }));
+    expect((await lookup("320193")).structuredContent).toMatchObject({ outcome: "error", error: { category: "upstream_response_error", retryable: false } });
+  });
+
+  it("returns a discovery error, not no matches, for directory 404", async () => {
+    secFetch.mockImplementation(async () => new Response(null, { status: 404 }));
+    const result = await lookup("group");
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ outcome: "error", results: [], error: { category: "upstream_response_error" } });
+    expect(secFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("enforces the 10-second request timeout including a stalled body", async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const deadlines = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => timeout(ms === 10_000 ? 40 : ms));
+    secFetch.mockImplementation(async (_url, options) => new Response(new ReadableStream({
+      start(controller) {
+        options!.signal!.addEventListener("abort", () => controller.error(options!.signal!.reason), { once: true });
+      },
+    })));
+    const result = await lookup("320193");
+    expect(result.structuredContent).toMatchObject({ outcome: "error", error: { category: "upstream_timeout", retryable: true } });
+    expect(deadlines).toHaveBeenCalledWith(10_000);
+    expect(deadlines).toHaveBeenCalledWith(30_000);
+    expect(secFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the overall deadline while waiting for a local request slot", async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await Promise.all(Array.from({ length: 5 }, () => lookup("320193")));
+    secFetch.mockClear();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const deadlines = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => timeout(ms === 30_000 ? 40 : ms));
+    const result = await lookup("320193");
+    expect(result.structuredContent).toMatchObject({ outcome: "error", error: { category: "upstream_timeout", retryable: true } });
+    expect(deadlines).toHaveBeenCalledWith(30_000);
+    expect(secFetch).not.toHaveBeenCalled();
+  });
+
+  it("preserves completed profiles when the shared overall deadline aborts remaining requests", async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => timeout(ms === 30_000 ? 100 : ms));
+    secFetch.mockImplementation(async (url, options) => {
+      if (String(url) === directoryUrl) return Response.json(directory);
+      if (String(url).endsWith("0000000001.json")) return Response.json({ ...fixture, cik: 1 });
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = options!.signal!;
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    const result = await lookup("group");
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ outcome: "partial", results: [{ cik: "0000000001" }], failures: [
+      { cik: "0000000002", category: "upstream_timeout", retryable: true },
+      { cik: "0000000003", category: "upstream_timeout", retryable: true },
+    ] });
+    expect(secFetch).toHaveBeenCalledTimes(4);
+  });
 });
 afterAll(async () => { http.closeAllConnections(); await new Promise<void>((resolve) => http.close(() => resolve())); });
 

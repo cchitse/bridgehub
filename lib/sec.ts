@@ -2,7 +2,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 
 export class LookupError extends Error {
-  constructor(public readonly category: string, message: string) { super(message); }
+  constructor(public readonly category: string, message: string, public readonly retryable = false) { super(message); }
+}
+
+export function describeFailure(error: unknown) {
+  const failure = error instanceof LookupError ? error : new LookupError("internal_error", "BridgeHub could not complete this lookup.");
+  return { category: failure.category, message: failure.message, retryable: failure.retryable };
 }
 
 // Local, single-process pacing only. Shared deployment limits belong to ticket 04.
@@ -36,23 +41,30 @@ async function fetchSecJson(sourceUrl: string, signal: AbortSignal) {
     throw new LookupError("configuration_error", "Set SEC_CONTACT_EMAIL to a real operator contact before requesting SEC data.");
   }
 
+  let requestSignal = signal;
   try {
     await waitForRequestSlot(signal);
+    requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
     const response = await fetch(sourceUrl, {
       headers: { "User-Agent": `BridgeHub ${contact}`, Accept: "application/json" },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+      signal: requestSignal,
       cache: "no-store",
       redirect: "error",
     });
     if (response.status === 404) { await response.body?.cancel(); return null; }
     if (!response.ok) {
       await response.body?.cancel();
-      throw new LookupError("upstream_unavailable", "SEC could not provide this profile. Retry later.");
+      if (response.status === 429) throw new LookupError("upstream_rate_limited", "SEC is limiting requests. Retry later.", true);
+      if (response.status === 403) throw new LookupError("upstream_blocked", "SEC blocked this request. Check the operator contact and network access before retrying.");
+      if (response.status >= 500) throw new LookupError("upstream_unavailable", "SEC is temporarily unavailable. Retry later.", true);
+      throw new LookupError("upstream_response_error", "SEC returned an unexpected response.");
     }
     return { data: await response.json() as unknown, retrieved_at: new Date().toISOString() };
   } catch (error) {
     if (error instanceof LookupError) throw error;
-    throw new LookupError("upstream_unavailable", "SEC could not be reached or returned unreadable data. Retry later.");
+    if (requestSignal.aborted) throw new LookupError("upstream_timeout", "The SEC request or overall lookup deadline expired. Retry later.", true);
+    if (error instanceof SyntaxError) throw new LookupError("upstream_response_error", "SEC returned unreadable data instead of a company response.");
+    throw new LookupError("upstream_unavailable", "SEC could not be reached. Retry later.", true);
   }
 }
 

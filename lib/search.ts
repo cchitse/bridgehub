@@ -1,4 +1,4 @@
-import { LookupError, retrieveCompany, retrieveDirectory } from "./sec";
+import { describeFailure, LookupError, retrieveCompany, retrieveDirectory } from "./sec";
 
 export async function searchCompanies(query: string, limit: number) {
   // One budget covers discovery, waiting for request slots, and all profiles.
@@ -23,13 +23,25 @@ export async function searchCompanies(query: string, limit: number) {
   const unique = new Map<string, typeof matches[number]>();
   for (const company of matches) if (!unique.has(company.cik)) unique.set(company.cik, company);
   const selected = [...unique.values()].slice(0, limit);
-  const profiles = await Promise.all(selected.map(async (company) => {
+  const settled = await Promise.allSettled(selected.map(async (company) => {
     const profile = await retrieveCompany(company.cik, signal);
-    if (!profile) throw new LookupError("upstream_response_error", "A matching company's SEC profile is unavailable. Retry later.");
+    if (!profile) throw new LookupError("upstream_not_found", "SEC no longer provides the profile selected from its directory.");
     return profile;
   }));
+  const profiles: NonNullable<Awaited<ReturnType<typeof retrieveCompany>>>[] = [];
+  const failures: ({ cik: string } & ReturnType<typeof describeFailure>)[] = [];
+  for (const [index, result] of settled.entries()) {
+    if (result.status === "fulfilled") profiles.push(result.value);
+    else failures.push({ cik: selected[index].cik, ...describeFailure(result.reason) });
+  }
+  const outcome = failures.length ? (profiles.length ? "partial" : "error") : (profiles.length ? "ok" : "no_matches");
   return {
-    query, limit, outcome: profiles.length ? "ok" : "no_matches", results: profiles,
+    query, limit, outcome, results: profiles,
     truncated: unique.size > limit, directory_source: directory.source,
+    ...(failures.length ? { failures, warnings: ["Results are incomplete because one or more selected company profiles could not be retrieved."] } : {}),
+    ...(outcome === "error" ? { error: {
+      category: "profiles_unavailable", message: "None of the selected company profiles could be retrieved. See failures for the individual reasons.",
+      retryable: failures.some((failure) => failure.retryable),
+    } } : {}),
   };
 }

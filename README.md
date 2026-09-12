@@ -38,9 +38,15 @@ For a production-mode local check, use `npm run build` followed by `npm start`. 
 
 The output envelope includes query, limit, outcome, results, and truncated. Directory-based searches also include `directory_source` with `source_url` and the directory's original `retrieved_at`. Each profile includes cik, ticker, name, sic, sic_description, exchange, fiscal_year_end, state_of_incorporation, recent_filings_count, source_url, and retrieved_at. Tickers/exchanges are arrays; unavailable scalar metadata is null. Recent filings count means the number of accession numbers in the fetched recent filings array, not a lifetime count. The UTC retrieval time records when BridgeHub fetched the data, not SEC's last modification time.
 
-This slice fetches the directory on demand; the shared 24-hour cache belongs to ticket 04. If a selected profile is unavailable, the call currently reports an error. Partial-result recovery belongs to ticket 03.
+This slice fetches the directory on demand; the shared 24-hour cache belongs to ticket 04. If some selected profiles fail, successful profiles are returned with `outcome: partial`, a warning, and a `failures` list containing each failed CIK, category, message, and retryable flag. Truncation due to the result limit remains independent of retrieval failures. Partial responses retain usable data and do not set MCP's error flag.
 
-Responses provide structured content and an equivalent JSON text representation. A direct CIK profile lookup receiving an SEC 404 yields no_matches; directory or selected-profile failures produce errors. Upstream failures and invalid identities return errors rather than invented data. Missing operator configuration does not prevent discovery but prevents live retrieval.
+If every selected profile fails, the response uses `outcome: error` and MCP's error flag, retaining directory provenance, truncation, and individual failure details. The aggregate `profiles_unavailable` error is retryable if at least one failure is retryable. Direct CIK or discovery errors also set MCP's error flag. Failures never synthesize missing profiles.
+
+Responses provide structured content and an equivalent JSON text representation. A direct CIK profile lookup receiving an SEC 404 yields no_matches; a selected-profile 404 is an `upstream_not_found` failure, while a directory 404 is a discovery error. Missing operator configuration does not prevent discovery but prevents live retrieval.
+
+Failure categories distinguish SEC blocking (`upstream_blocked`), SEC rate limiting (`upstream_rate_limited`), network/server failures (`upstream_unavailable`), invalid data (`upstream_response_error`), and exceeded request/lookup budgets (`upstream_timeout`). Retryable indicates whether a later attempt may help; no automatic retries occur. Blocking requires checking operator/network configuration before retrying. Error messages omit SEC response bodies, internal exceptions, and secrets.
+
+Protocol validation is an exception to the structured retrieval envelope: missing/wrong-type arguments and out-of-range limits are rejected by the MCP SDK before the tool callback, using SDK-generated MCP errors. Validly typed but malformed CIKs reach the callback and receive BridgeHub's `invalid_input` envelope. Clients should handle MCP errors as well as structured retrieval outcomes.
 
 The bare trading symbol `CIK` is resolved as a ticker. A CIK-prefixed identifier must include its digits; malformed longer forms such as `CIKabc` remain invalid.
 

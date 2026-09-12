@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { LookupError } from "./sec";
+import { describeFailure } from "./sec";
 import { searchCompanies } from "./search";
 
 export function createMcpServer() {
@@ -15,10 +15,9 @@ export function createMcpServer() {
   }, async ({ query, limit }) => {
     try {
       const output = await searchCompanies(query, limit);
-      return { structuredContent: output, content: [{ type: "text", text: JSON.stringify(output) }] };
+      return { isError: output.outcome === "error", structuredContent: output, content: [{ type: "text", text: JSON.stringify(output) }] };
     } catch (error) {
-      const failure = error instanceof LookupError ? error : new LookupError("internal_error", "BridgeHub could not complete this lookup.");
-      const output = { query, limit, outcome: "error", results: [], truncated: false, error: { category: failure.category, message: failure.message } };
+      const output = { query, limit, outcome: "error", results: [], truncated: false, error: describeFailure(error) };
       return { isError: true, structuredContent: output, content: [{ type: "text", text: JSON.stringify(output) }] };
     }
   });
