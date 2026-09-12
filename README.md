@@ -1,6 +1,16 @@
 # BridgeHub — company search
 
-A Next.js application exposing one anonymous Streamable HTTP MCP tool: `us_search_sec_company`. Search by ticker, company-name substring, or CIK. The directory cache and shared request controls are implemented. The three-page website and publishing belong to later tickets.
+A Next.js application with three English informational pages and one anonymous Streamable HTTP MCP tool: `us_search_sec_company`. Search by ticker, company-name substring, or CIK. Directory caching and shared request controls are implemented. Public hosting remains ticket 06.
+
+## Website
+
+- `/`: product introduction, current SEC support, and connect/ask/retrieve workflow.
+- `/data`: tool inputs, output types, coverage, provenance, and an explicitly illustrative response.
+- `/tutorial`: Windows PowerShell setup for Codex CLI, endpoint selection, verification, an AAPL prompt, and troubleshooting.
+
+All three pages are static and readable without SEC or Redis access. Navigation uses ordinary accessible links; there is no data-search form or live preview. Local development must remain running to serve both the website and MCP.
+
+Leave `BRIDGEHUB_PUBLIC_ORIGIN` empty until the public deployment has been verified. Then set it to the actual HTTPS origin (without a path, query, or credentials) and rebuild. The tutorial derives `/api/mcp` from that origin. Until configured, it explicitly says the public endpoint is unpublished and provides no placeholder connection command. This display setting is separate from the endpoint's `BRIDGEHUB_ORIGIN` request-validation setting; deployment should configure both to the verified public origin.
 
 ## Run locally
 
